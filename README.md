@@ -6,7 +6,7 @@ Servidor MCP (Model Context Protocol) para gerenciar túneis ngrok diretamente d
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/ngrok-mcp-server.git
+git clone https://github.com/SamukDantas/ngrok-mcp-server.git
 cd ngrok-mcp-server
 
 # Instale as dependências
@@ -39,7 +39,7 @@ Adicione o MCP do ngrok no seu `opencode.json`:
   "mcpServers": {
     "ngrok": {
       "command": "node",
-      "args": ["C:/Users/SEU_USUARIO/.config/opencode/mcp-servers/ngrok/dist/index.js"]
+      "args": ["C:/Users/SamukDantas/.config/opencode/mcp-servers/ngrok/dist/index.js"]
     }
   }
 }
