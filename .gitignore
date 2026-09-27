@@ -6,3 +6,6 @@ dist/
 # Não versionar arquivos com credenciais (ex.: ngrok-config.json)
 *-config.json
 .env
+
+# Executável do ngrok para uso local (não redistribuir; baixe em ngrok.com/download)
+bin/
