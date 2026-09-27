@@ -200,6 +200,18 @@ ngrok_diagnose {"region": "us"}
 | `name` | string | Nome do endpoint |
 | `trafficPolicyFile` | string | Caminho para o arquivo de traffic policy |
 
+## Segurança
+
+Os argumentos das ferramentas vêm do modelo, então são tratados como entrada não confiável. O ngrok é executado sem shell (`execFile` com lista de argumentos): cada valor chega ao ngrok como um único argumento literal, e aspas, `;`, `&`, `$()` ou crases não executam nada. IDs e nomes de túnel que começam com `-` são recusados, para não serem lidos como flags. O authtoken é passado ao ngrok pela variável `NGROK_AUTHTOKEN`, nunca pela linha de comando.
+
+## Desenvolvimento
+
+```bash
+npm test
+```
+
+Compila e roda os testes: o servidor sobe de verdade via stdio, com um ngrok falso no lugar do `npx`, e os testes verificam o argv recebido.
+
 ## Licença
 
 [MIT](LICENSE) © 2026 Samuel Dantas
