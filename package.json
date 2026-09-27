@@ -13,5 +13,12 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
+  },
+  "description": "MCP server for managing ngrok tunnels from AI assistants",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SamukDantas/ngrok-mcp-server.git"
   }
 }
