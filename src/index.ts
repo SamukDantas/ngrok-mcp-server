@@ -4,69 +4,258 @@ import { z } from "zod";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { execFile } from "child_process";
+import readline from "readline";
+import { execFile, spawn, spawnSync, type ChildProcess } from "child_process";
 import { promisify } from "util";
+import { fileURLToPath } from "url";
 
 const execFileAsync = promisify(execFile);
 
 interface NgrokConfig {
   authtoken: string;
+  ngrokPath: string;
 }
 
 interface TunnelInfo {
   id: string;
   url: string;
   proto: string;
+  /** Nome do túnel no agente: `command_line`, ou o nome no arquivo de configuração. */
+  nome: string;
+  /** Endereço da API local do agente que mantém o túnel (ex.: 127.0.0.1:4040). */
+  webAddr?: string;
+  /** Processo do agente ngrok; o túnel existe enquanto ele estiver rodando. */
+  processo: ChildProcess;
   config: Record<string, unknown>;
 }
 
 const tunnels: Map<string, TunnelInfo> = new Map();
+let proximoId = 1;
+
+const raizDoProjeto = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const nomeDoBinario = process.platform === "win32" ? "ngrok.exe" : "ngrok";
+const TEMPO_PARA_ABRIR_MS = 30_000;
 
 function configPath(): string {
   return path.join(os.homedir(), ".config", "opencode", "ngrok-config.json");
 }
 
-/** Authtoken do arquivo de configuração, se existir. Ausente: o ngrok usa a própria configuração. */
-function loadAuthtoken(): string | undefined {
+/** Conteúdo de ngrok-config.json, se existir. Ausente: o ngrok usa a própria configuração. */
+function loadConfig(): Partial<NgrokConfig> {
   const file = configPath();
-  if (!fs.existsSync(file)) return undefined;
-  const config = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<NgrokConfig>;
-  return typeof config.authtoken === "string" && config.authtoken ? config.authtoken : undefined;
+  if (!fs.existsSync(file)) return {};
+  const config: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
+  if (typeof config !== "object" || config === null) return {};
+  const { authtoken, ngrokPath } = config as Record<string, unknown>;
+  return {
+    authtoken: typeof authtoken === "string" && authtoken ? authtoken : undefined,
+    ngrokPath: typeof ngrokPath === "string" && ngrokPath ? ngrokPath : undefined,
+  };
+}
+
+/** Procura o executável do ngrok no PATH. */
+function ngrokNoPath(): string | undefined {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidato = path.join(dir, nomeDoBinario);
+    if (fs.existsSync(candidato)) return candidato;
+  }
+  return undefined;
 }
 
 /**
- * Como executar o `npx` sem shell. No Windows o `npx` é um .cmd, que o Node só
- * executa via shell; por isso o `npx-cli.js` do npm é chamado pelo próprio Node.
- * `NGROK_MCP_RUNNER` (caminho de um script .js) substitui o npx nos testes.
+ * Qual executável roda o ngrok, nesta ordem:
+ * 1. `NGROK_MCP_RUNNER` (script .js que substitui o ngrok nos testes);
+ * 2. `NGROK_BIN` ou `ngrokPath` no ngrok-config.json;
+ * 3. `bin/ngrok(.exe)` dentro do projeto (ignorado pelo git);
+ * 4. o `ngrok` do PATH;
+ * 5. `npx ngrok`. No Windows o `npx` é um .cmd, que o Node só executa via
+ *    shell; por isso o `npx-cli.js` do npm é chamado pelo próprio Node.
  */
-function npxCommand(): { command: string; prefix: string[] } {
+function ngrokCommand(): { command: string; prefix: string[] } {
   const runner = process.env.NGROK_MCP_RUNNER;
-  if (runner) return { command: process.execPath, prefix: [runner] };
-  if (process.platform !== "win32") return { command: "npx", prefix: [] };
+  if (runner) return { command: process.execPath, prefix: [runner, "ngrok"] };
+
+  const local = path.join(raizDoProjeto, "bin", nomeDoBinario);
+  const bin = process.env.NGROK_BIN || loadConfig().ngrokPath || (fs.existsSync(local) ? local : undefined) || ngrokNoPath();
+  if (bin) return { command: bin, prefix: [] };
+
+  if (process.platform !== "win32") return { command: "npx", prefix: ["ngrok"] };
   const cli = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npx-cli.js");
-  return { command: process.execPath, prefix: [cli] };
+  return { command: process.execPath, prefix: [cli, "ngrok"] };
+}
+
+/** Variáveis de ambiente do ngrok: o authtoken do arquivo vai por NGROK_AUTHTOKEN. */
+function ngrokEnv(): NodeJS.ProcessEnv {
+  const { authtoken } = loadConfig();
+  return authtoken ? { ...process.env, NGROK_AUTHTOKEN: authtoken } : process.env;
 }
 
 /**
- * Executa `npx ngrok <args>` SEM shell: cada argumento é passado como está,
- * então valores vindos do modelo (auth, descrição, metadados, IDs) não podem
+ * Executa um comando curto do ngrok (`version`, `config check`...) SEM shell:
+ * cada argumento é passado como está, então valores vindos do modelo não podem
  * injetar comandos. O authtoken vai por variável de ambiente, não por argumento,
  * para não aparecer na lista de processos.
  */
 async function runNgrok(args: string[]): Promise<string> {
-  const { command, prefix } = npxCommand();
-  const authtoken = loadAuthtoken();
+  const { command, prefix } = ngrokCommand();
   try {
-    const { stdout, stderr } = await execFileAsync(command, [...prefix, "ngrok", ...args], {
+    const { stdout, stderr } = await execFileAsync(command, [...prefix, ...args], {
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
       windowsHide: true,
-      env: authtoken ? { ...process.env, NGROK_AUTHTOKEN: authtoken } : process.env,
+      env: ngrokEnv(),
     });
     return stdout || stderr;
   } catch (error: unknown) {
     const err = error as { message?: string; stdout?: string; stderr?: string };
     return err.stdout || err.stderr || err.message || "Unknown error";
+  }
+}
+
+interface AgenteIniciado {
+  processo: ChildProcess;
+  webAddr?: string;
+  tuneis: { nome: string; url: string }[];
+}
+
+/**
+ * Sobe um agente ngrok (`ngrok http|tcp|tls|start ...`), que fica rodando enquanto
+ * o túnel existir, e espera o log JSON anunciar os túneis abertos. Também sem shell.
+ * `esperados` é quantos túneis aguardar; sem ele (`start --all`), conclui quando o
+ * log fica quieto depois do primeiro túnel.
+ */
+function iniciarAgente(args: string[], esperados?: number): Promise<AgenteIniciado> {
+  const { command, prefix } = ngrokCommand();
+  const processo = spawn(command, [...prefix, ...args, "--log=stdout", "--log-format=json"], {
+    env: ngrokEnv(),
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  return new Promise((resolve, reject) => {
+    const tuneis: AgenteIniciado["tuneis"] = [];
+    const erros: string[] = [];
+    let stderr = "";
+    let webAddr: string | undefined;
+    let quieto: NodeJS.Timeout | undefined;
+    let concluido = false;
+
+    const detalhes = () => {
+      const texto = [...new Set([...erros, stderr.trim()])].filter(Boolean).join("; ") || "sem detalhes";
+      return /certificate signed by unknown authority/.test(texto)
+        ? `${texto}. Um antivírus ou proxy está interceptando o TLS do ngrok: exclua o ngrok (connect.ngrok-agent.com) da inspeção HTTPS.`
+        : texto;
+    };
+    const concluir = (erro?: Error) => {
+      if (concluido) return;
+      concluido = true;
+      clearTimeout(limite);
+      clearTimeout(quieto);
+      if (erro) {
+        matar(processo);
+        reject(erro);
+      } else {
+        resolve({ processo, webAddr, tuneis });
+      }
+    };
+    const limite = setTimeout(
+      () => concluir(new Error(`o ngrok não abriu o túnel em ${TEMPO_PARA_ABRIR_MS / 1000}s: ${detalhes()}`)),
+      TEMPO_PARA_ABRIR_MS,
+    );
+
+    readline.createInterface({ input: processo.stdout! }).on("line", (linha) => {
+      let log: Record<string, unknown>;
+      try {
+        log = JSON.parse(linha);
+      } catch {
+        if (linha.trim()) erros.push(linha.trim());
+        return;
+      }
+      if (log.obj === "web" && typeof log.addr === "string") webAddr = log.addr;
+      if ((log.lvl === "eror" || log.lvl === "crit") && typeof log.err === "string") erros.push(log.err);
+      if (log.msg === "started tunnel" && typeof log.url === "string") {
+        tuneis.push({ nome: typeof log.name === "string" ? log.name : "command_line", url: log.url });
+        if (esperados !== undefined) {
+          if (tuneis.length >= esperados) concluir();
+        } else {
+          clearTimeout(quieto);
+          quieto = setTimeout(() => concluir(), 1500);
+        }
+      }
+    });
+    processo.stderr!.on("data", (d) => {
+      stderr += d;
+    });
+    processo.on("error", (e) => concluir(e));
+    processo.on("exit", (code) => concluir(new Error(`o ngrok encerrou (código ${code}) antes de abrir o túnel: ${detalhes()}`)));
+  });
+}
+
+/** Encerra o agente. No Windows, derruba a árvore toda (o `npx` deixaria o ngrok órfão). */
+function matar(processo: ChildProcess): void {
+  if (processo.exitCode !== null || processo.pid === undefined) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(processo.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  } else {
+    processo.kill();
+  }
+}
+
+function protoDaUrl(url: string): string {
+  const esquema = url.split("://")[0];
+  return esquema === "https" ? "http" : esquema;
+}
+
+/** Registra os túneis de um agente; eles saem da lista quando o agente termina. */
+function registrar(agente: AgenteIniciado, config: Record<string, unknown>, proto?: string): TunnelInfo[] {
+  const criados = agente.tuneis.map((t) => {
+    const info: TunnelInfo = {
+      id: `t${proximoId++}`,
+      url: t.url,
+      proto: proto ?? protoDaUrl(t.url),
+      nome: t.nome,
+      webAddr: agente.webAddr,
+      processo: agente.processo,
+      config,
+    };
+    tunnels.set(info.id, info);
+    return info;
+  });
+  agente.processo.on("exit", () => {
+    for (const t of criados) tunnels.delete(t.id);
+  });
+  return criados;
+}
+
+async function abrirTunel(args: string[], proto: string, config: Record<string, unknown>): Promise<TunnelInfo> {
+  const agente = await iniciarAgente(args, 1);
+  return registrar(agente, config, proto)[0];
+}
+
+function encontrar(tunnelId?: string, url?: string): TunnelInfo | undefined {
+  if (tunnelId) return tunnels.get(tunnelId);
+  if (url) return [...tunnels.values()].find((t) => t.url === url);
+  return undefined;
+}
+
+/** Encerra o agente do túnel; devolve todos os túneis que ele mantinha. */
+function encerrar(alvo: TunnelInfo): TunnelInfo[] {
+  const doMesmoAgente = [...tunnels.values()].filter((t) => t.processo === alvo.processo);
+  matar(alvo.processo);
+  for (const t of doMesmoAgente) tunnels.delete(t.id);
+  return doMesmoAgente;
+}
+
+/** GET na API local do agente (a mesma da interface web em 127.0.0.1:4040). */
+async function apiDoAgente(webAddr: string, caminho: string): Promise<unknown> {
+  const res = await fetch(`http://${webAddr}${caminho}`, { signal: AbortSignal.timeout(10_000) });
+  const corpo = await res.text();
+  if (!res.ok) throw new Error(`API do agente respondeu ${res.status}: ${corpo.trim()}`);
+  try {
+    return JSON.parse(corpo);
+  } catch {
+    return corpo;
   }
 }
 
@@ -76,6 +265,8 @@ function positional(value: string, label: string): string {
   return value;
 }
 
+const NAO_ENCONTRADO = "❌ Túnel não encontrado. Use ngrok_list_tunnels para ver os túneis ativos.";
+
 const server = new McpServer({
   name: "ngrok",
   version: "1.0.0",
@@ -83,58 +274,23 @@ const server = new McpServer({
 
 server.tool(
   "ngrok_list_tunnels",
-  "Lista todos os túneis ativos do ngrok",
+  "Lista os túneis ativos abertos por este servidor",
   {},
   async () => {
-    try {
-      const output = await runNgrok(["api", "tunnels", "list", "--format=json"]);
-      let data;
-      try {
-        data = JSON.parse(output);
-      } catch {
-        if (output.includes("no tunnels running") || output.includes("tunnels not found")) {
-          return {
-            content: [{ type: "text", text: "❌ Nenhum túnel ativo! Execute ngrok_connect ou ngrok_http para criar um." }],
-          };
-        }
-        return {
-          content: [{ type: "text", text: `Erro: ${output}` }],
-        };
-      }
-      
-      tunnels.clear();
-      
-      if (!data.tunnels || data.tunnels.length === 0) {
-        return {
-          content: [{ type: "text", text: "❌ Nenhum túnel ativo! Execute ngrok_connect ou ngrok_http para criar um." }],
-        };
-      }
-      
-      for (const tunnel of data.tunnels) {
-        tunnels.set(tunnel.id, {
-          id: tunnel.id,
-          url: tunnel.public_url,
-          proto: tunnel.proto,
-          config: tunnel.config || {},
-        });
-      }
-      
-      let text = `🚇 **Túneis Ativos** (${tunnels.size}):\n\n`;
-      for (const [id, tunnel] of tunnels) {
-        text += `• ${tunnel.url}\n`;
-        text += `  Proto: ${tunnel.proto}\n`;
-        text += `  ID: ${id}\n\n`;
-      }
-      
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
+    if (tunnels.size === 0) {
       return {
-        content: [{
-          type: "text",
-          text: `❌ Erro ao listar túneis: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
-        }],
+        content: [{ type: "text", text: "❌ Nenhum túnel ativo! Execute ngrok_connect ou ngrok_http para criar um." }],
       };
     }
+
+    let text = `🚇 **Túneis Ativos** (${tunnels.size}):\n\n`;
+    for (const [id, tunnel] of tunnels) {
+      text += `• ${tunnel.url}\n`;
+      text += `  Proto: ${tunnel.proto}\n`;
+      text += `  ID: ${id}\n\n`;
+    }
+
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -150,33 +306,22 @@ server.tool(
   },
   async ({ port, subdomain, domain, proto, auth }) => {
     try {
-      const args: string[] = [proto, String(port)];
-      
+      // No ngrok v3, túneis HTTPS são criados pelo comando `http`.
+      const comando = proto === "https" ? "http" : proto;
+      const args: string[] = [comando, String(port)];
+
       if (subdomain) args.push(`--subdomain=${subdomain}`);
       if (domain) args.push(`--domain=${domain}`);
       if (auth) args.push(`--basic-auth=${auth}`);
-      
-      const output = await runNgrok(args);
-      
-      const urlMatch = output.match(/url=([^\s]+)/);
-      const idMatch = output.match(/id=([^\s]+)/);
-      
-      const url = urlMatch ? urlMatch[1] : "Unknown";
-      const id = idMatch ? idMatch[1] : "Unknown";
-      
-      tunnels.set(id, {
-        id,
-        url,
-        proto,
-        config: { port, subdomain, domain, auth },
-      });
-      
+
+      const tunel = await abrirTunel(args, comando, { port, subdomain, domain, auth });
+
       let text = `✅ **Túnel Criado**\n\n`;
-      text += `🔗 ${url}\n`;
-      text += `📋 Proto: ${proto}\n`;
+      text += `🔗 ${tunel.url}\n`;
+      text += `📋 Proto: ${tunel.proto}\n`;
       text += `🚪 Porta: ${port}\n`;
-      text += `🆔 ID: ${id}`;
-      
+      text += `🆔 ID: ${tunel.id}`;
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -197,41 +342,20 @@ server.tool(
     url: z.string().optional().describe("URL do túnel (alternativa ao ID)"),
   },
   async ({ tunnelId, url }) => {
-    try {
-      let targetId = tunnelId;
-      
-      if (!targetId && url) {
-        for (const [id, tunnel] of tunnels) {
-          if (tunnel.url === url) {
-            targetId = id;
-            break;
-          }
-        }
-      }
-      
-      if (!targetId) {
-        return {
-          content: [{ type: "text", text: "❌ Túnel não encontrado. Use ngrok_list_tunnels para ver os túneis ativos." }],
-        };
-      }
-      
-      await runNgrok(["disconnect", positional(targetId, "ID do túnel")]);
-      tunnels.delete(targetId);
-      
-      return {
-        content: [{
-          type: "text",
-          text: `✅ **Túnel Desconectado**\n\n🆔 ID: ${targetId}`,
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `❌ Erro ao desconectar: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
-        }],
-      };
+    const alvo = encontrar(tunnelId, url);
+    if (!alvo) {
+      return { content: [{ type: "text", text: NAO_ENCONTRADO }] };
     }
+
+    const encerrados = encerrar(alvo);
+
+    let text = `✅ **Túnel Desconectado**\n\n🆔 ID: ${alvo.id}\n🔗 ${alvo.url}`;
+    const outros = encerrados.filter((t) => t.id !== alvo.id);
+    if (outros.length > 0) {
+      text += `\n\nO mesmo agente também mantinha: ${outros.map((t) => t.url).join(", ")} (encerrados junto).`;
+    }
+
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -240,23 +364,20 @@ server.tool(
   "Mostra o status da sessão ngrok",
   {},
   async () => {
-    try {
-      const output = await runNgrok(["version"]);
-      
-      let text = `📊 **Status ngrok**\n\n`;
-      text += `Versão: ${output.trim()}\n`;
-      text += `\n🟢 ngrok está instalado e configurado.\n`;
-      text += `Web Interface: http://127.0.0.1:4040 (quando um túnel estiver ativo)`;
-      
-      return { content: [{ type: "text", text }] };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `❌ Erro ao buscar status: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
-        }],
-      };
+    const output = (await runNgrok(["version"])).trim();
+
+    if (!/ngrok version/i.test(output)) {
+      return { content: [{ type: "text", text: `❌ **ngrok indisponível**\n\n${output}` }] };
     }
+
+    let text = `📊 **Status ngrok**\n\n`;
+    text += `Versão: ${output}\n`;
+    text += `Authtoken em ngrok-config.json: ${loadConfig().authtoken ? "sim" : "não (usa a configuração do próprio ngrok)"}\n`;
+    text += `Túneis ativos: ${tunnels.size}\n`;
+    const interfaces = [...new Set([...tunnels.values()].map((t) => t.webAddr).filter(Boolean))];
+    if (interfaces.length > 0) text += `Web Interface: ${interfaces.map((a) => `http://${a}`).join(", ")}`;
+
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -288,7 +409,7 @@ server.tool(
     inspect: z.boolean().optional().describe("Habilitar inspeção HTTP (default: true)"),
     trafficPolicyFile: z.string().optional().describe("Path para arquivo de traffic policy (YAML/JSON)"),
   },
-  async ({ 
+  async ({
     port, url, subdomain, domain, basicAuth, hostHeader,
     requestHeaderAdd, responseHeaderAdd, compression,
     cidrAllow, cidrDeny, oauthProvider, oauthAllowDomain,
@@ -297,7 +418,7 @@ server.tool(
   }) => {
     try {
       const args: string[] = ["http", String(port)];
-      
+
       if (url) args.push(`--url=${url}`);
       if (subdomain) args.push(`--subdomain=${subdomain}`);
       if (domain) args.push(`--domain=${domain}`);
@@ -320,32 +441,19 @@ server.tool(
       if (name) args.push(`--name=${name}`);
       if (inspect === false) args.push("--inspect=false");
       if (trafficPolicyFile) args.push(`--traffic-policy-file=${trafficPolicyFile}`);
-      
-      const output = await runNgrok(args);
-      
-      const urlMatch = output.match(/url=([^\s]+)/);
-      const idMatch = output.match(/id=([^\s]+)/);
-      
-      const tunnelUrl = urlMatch ? urlMatch[1] : "Unknown";
-      const id = idMatch ? idMatch[1] : "Unknown";
-      
-      tunnels.set(id, {
-        id,
-        url: tunnelUrl,
-        proto: "http",
-        config: { port, url, subdomain, domain, basicAuth, hostHeader, requestHeaderAdd, responseHeaderAdd, compression, cidrAllow, cidrDeny, oauthProvider, oauthAllowDomain, oauthAllowEmail, oauthScope, webhookVerification, webhookSecret, mutualTlsCas, metadata, description, name, inspect, trafficPolicyFile },
-      });
-      
+
+      const tunel = await abrirTunel(args, "http", { port, url, subdomain, domain, basicAuth, hostHeader, requestHeaderAdd, responseHeaderAdd, compression, cidrAllow, cidrDeny, oauthProvider, oauthAllowDomain, oauthAllowEmail, oauthScope, webhookVerification, webhookSecret, mutualTlsCas, metadata, description, name, inspect, trafficPolicyFile });
+
       let text = `✅ **Túnel HTTP Criado**\n\n`;
-      text += `🔗 ${tunnelUrl}\n`;
+      text += `🔗 ${tunel.url}\n`;
       text += `🚪 Porta: ${port}\n`;
       if (basicAuth) text += `🔐 Basic Auth: Enabled\n`;
       if (oauthProvider) text += `🔐 OAuth: ${oauthProvider}\n`;
       if (compression) text += `🗜️ Compressão: Enabled\n`;
       if (cidrAllow) text += `🔒 CIDR Allow: ${cidrAllow}\n`;
       if (mutualTlsCas) text += `🔐 mTLS: Enabled\n`;
-      text += `🆔 ID: ${id}`;
-      
+      text += `🆔 ID: ${tunel.id}`;
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -375,7 +483,7 @@ server.tool(
   async ({ port, url, remotePort, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile }) => {
     try {
       const args: string[] = ["tcp", String(port)];
-      
+
       if (url) args.push(`--url=${url}`);
       if (remotePort) args.push(`--remote-port=${remotePort}`);
       if (cidrAllow) args.push(`--cidr-allow=${cidrAllow}`);
@@ -384,29 +492,16 @@ server.tool(
       if (description) args.push(`--description=${description}`);
       if (name) args.push(`--name=${name}`);
       if (trafficPolicyFile) args.push(`--traffic-policy-file=${trafficPolicyFile}`);
-      
-      const output = await runNgrok(args);
-      
-      const urlMatch = output.match(/url=([^\s]+)/);
-      const idMatch = output.match(/id=([^\s]+)/);
-      
-      const tunnelUrl = urlMatch ? urlMatch[1] : "Unknown";
-      const id = idMatch ? idMatch[1] : "Unknown";
-      
-      tunnels.set(id, {
-        id,
-        url: tunnelUrl,
-        proto: "tcp",
-        config: { port, url, remotePort, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile },
-      });
-      
+
+      const tunel = await abrirTunel(args, "tcp", { port, url, remotePort, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile });
+
       let text = `✅ **Túnel TCP Criado**\n\n`;
-      text += `🔗 ${tunnelUrl}\n`;
+      text += `🔗 ${tunel.url}\n`;
       text += `🚪 Porta Local: ${port}\n`;
       if (remotePort) text += `🌐 Porta Remota: ${remotePort}\n`;
       if (cidrAllow) text += `🔒 CIDR Allow: ${cidrAllow}\n`;
-      text += `🆔 ID: ${id}`;
-      
+      text += `🆔 ID: ${tunel.id}`;
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -438,7 +533,7 @@ server.tool(
   async ({ port, url, crt, key, mutualTlsCas, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile }) => {
     try {
       const args: string[] = ["tls", String(port)];
-      
+
       if (url) args.push(`--url=${url}`);
       if (crt) args.push(`--crt=${crt}`);
       if (key) args.push(`--key=${key}`);
@@ -449,30 +544,17 @@ server.tool(
       if (description) args.push(`--description=${description}`);
       if (name) args.push(`--name=${name}`);
       if (trafficPolicyFile) args.push(`--traffic-policy-file=${trafficPolicyFile}`);
-      
-      const output = await runNgrok(args);
-      
-      const urlMatch = output.match(/url=([^\s]+)/);
-      const idMatch = output.match(/id=([^\s]+)/);
-      
-      const tunnelUrl = urlMatch ? urlMatch[1] : "Unknown";
-      const id = idMatch ? idMatch[1] : "Unknown";
-      
-      tunnels.set(id, {
-        id,
-        url: tunnelUrl,
-        proto: "tls",
-        config: { port, url, crt, key, mutualTlsCas, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile },
-      });
-      
+
+      const tunel = await abrirTunel(args, "tls", { port, url, crt, key, mutualTlsCas, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile });
+
       let text = `✅ **Túnel TLS Criado**\n\n`;
-      text += `🔗 ${tunnelUrl}\n`;
+      text += `🔗 ${tunel.url}\n`;
       text += `🚪 Porta Local: ${port}\n`;
       if (crt) text += `📜 Certificado: ${crt}\n`;
       if (mutualTlsCas) text += `🔐 mTLS (client cert): Enabled\n`;
       if (cidrAllow) text += `🔒 CIDR Allow: ${cidrAllow}\n`;
-      text += `🆔 ID: ${id}`;
-      
+      text += `🆔 ID: ${tunel.id}`;
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -496,24 +578,28 @@ server.tool(
   async ({ tunnels: tunnelNames, all, config }) => {
     try {
       const args: string[] = ["start"];
-      
-      if (all) {
+      let esperados: number | undefined;
+
+      if (all || tunnelNames.trim() === "--all") {
         args.push("--all");
-      } else if (tunnelNames) {
-        args.push(...tunnelNames.trim().split(/\s+/).map((n) => positional(n, "Nome de túnel")));
+      } else if (tunnelNames.trim()) {
+        const nomes = tunnelNames.trim().split(/\s+/).map((n) => positional(n, "Nome de túnel"));
+        args.push(...nomes);
+        esperados = nomes.length;
       } else {
         return {
           content: [{ type: "text", text: "❌ Especifique nomes de túneis ou use --all" }],
         };
       }
-      
+
       if (config) args.push(`--config=${config}`);
-      
-      const output = await runNgrok(args);
-      
-      let text = `✅ **Túneis Iniciados**\n\n`;
-      text += output;
-      
+
+      const agente = await iniciarAgente(args, esperados);
+      const criados = registrar(agente, { tunnels: tunnelNames, all, config });
+
+      let text = `✅ **Túneis Iniciados** (${criados.length})\n\n`;
+      for (const t of criados) text += `• ${t.nome}: ${t.url} (ID: ${t.id})\n`;
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -537,19 +623,19 @@ server.tool(
   async ({ region, ipv6, writeReport }) => {
     try {
       const args: string[] = ["diagnose"];
-      
+
       if (region) args.push(`--region=${region}`);
       if (ipv6) args.push("--ipv6");
       if (writeReport) args.push(`--write-report=${writeReport}`);
-      
+
       const output = await runNgrok(args);
-      
-      const isOk = output.includes("connectivity OK") || output.includes("success");
-      
-      let text = isOk 
+
+      const isOk = /connectivity OK|success|no issues/i.test(output) && !/error|fail/i.test(output);
+
+      let text = isOk
         ? `✅ **Diagnóstico OK**\n\n${output}`
         : `⚠️ **Problemas Detectados**\n\n${output}`;
-      
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -571,14 +657,14 @@ server.tool(
   async ({ channel }) => {
     try {
       const args: string[] = ["update"];
-      
+
       if (channel) args.push(`--channel=${channel}`);
-      
+
       const output = await runNgrok(args);
-      
+
       let text = `✅ **ngrok Atualizado**\n\n`;
       text += output;
-      
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -600,17 +686,17 @@ server.tool(
   async ({ config }) => {
     try {
       const args: string[] = ["config", "check"];
-      
+
       if (config) args.push(`--config=${config}`);
-      
+
       const output = await runNgrok(args);
-      
-      const isValid = output.includes("valid") || output.includes("OK");
-      
+
+      const isValid = /valid configuration/i.test(output) && !/error|invalid/i.test(output);
+
       let text = isValid
         ? `✅ **Configuração Válida**\n\n${output}`
         : `⚠️ **Problemas na Configuração**\n\n${output}`;
-      
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -625,21 +711,20 @@ server.tool(
 
 server.tool(
   "ngrok_config_edit",
-  "Abre o arquivo de configuração para edição",
+  "Mostra onde ficam os arquivos de configuração, para edição",
   {},
   async () => {
-    try {
-      const output = await runNgrok(["config", "edit"]);
-      
-      return { content: [{ type: "text", text: `📝 **Configuração**\n\n${output}` }] };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `❌ Erro ao editar config: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
-        }],
-      };
-    }
+    // `ngrok config edit` abre um editor interativo e travaria a chamada até ele
+    // fechar; por isso a ferramenta só aponta os arquivos.
+    const output = (await runNgrok(["config", "check"])).trim();
+    const arquivo = output.match(/configuration file at (.+)$/im)?.[1];
+
+    let text = `📝 **Configuração**\n\n`;
+    text += arquivo ? `Arquivo do ngrok: ${arquivo}\n` : `Arquivo do ngrok: não localizado (${output})\n`;
+    text += `Authtoken deste servidor: ${configPath()}\n\n`;
+    text += `Edite no seu editor e valide com ngrok_config_check.`;
+
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -648,24 +733,18 @@ server.tool(
   "Desconecta todos os túneis ativos",
   {},
   async () => {
-    try {
-      await runNgrok(["disconnect", "--all"]);
-      tunnels.clear();
-      
-      return {
-        content: [{
-          type: "text",
-          text: "✅ **Todos os túneis desconectados**",
-        }],
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `❌ Erro ao desconectar túneis: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
-        }],
-      };
-    }
+    const todos = [...tunnels.values()];
+    for (const processo of new Set(todos.map((t) => t.processo))) matar(processo);
+    tunnels.clear();
+
+    return {
+      content: [{
+        type: "text",
+        text: todos.length > 0
+          ? `✅ **Todos os túneis desconectados** (${todos.length})`
+          : "Nenhum túnel ativo para desconectar.",
+      }],
+    };
   }
 );
 
@@ -677,37 +756,32 @@ server.tool(
     url: z.string().optional().describe("URL do túnel (alternativa ao ID)"),
   },
   async ({ tunnelId, url }) => {
-    try {
-      let targetId = tunnelId;
-      
-      if (!targetId && url) {
-        for (const [id, tunnel] of tunnels) {
-          if (tunnel.url === url) {
-            targetId = id;
-            break;
-          }
-        }
-      }
-      
-      if (!targetId) {
-        return {
-          content: [{ type: "text", text: "❌ Túnel não encontrado." }],
-        };
-      }
-      
-      const output = await runNgrok(["inspect", positional(targetId, "ID do túnel")]);
-      
-      return { content: [{ type: "text", text: `📋 **Detalhes do Túnel**\n\n${output}` }] };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `❌ Erro ao inspecionar: ${error instanceof Error ? error.message : "Erro desconhecido"}`,
-        }],
-      };
+    const alvo = encontrar(tunnelId, url);
+    if (!alvo) {
+      return { content: [{ type: "text", text: NAO_ENCONTRADO }] };
     }
+
+    let text = `📋 **Detalhes do Túnel**\n\n`;
+    text += `🆔 ID: ${alvo.id}\n🔗 ${alvo.url}\n📋 Proto: ${alvo.proto}\n`;
+    if (!alvo.webAddr) return { content: [{ type: "text", text }] };
+
+    try {
+      const detalhes = await apiDoAgente(alvo.webAddr, `/api/tunnels/${encodeURIComponent(alvo.nome)}`);
+      text += `\n${JSON.stringify(detalhes, null, 2)}`;
+    } catch (error) {
+      text += `\n⚠️ Detalhes do agente indisponíveis: ${error instanceof Error ? error.message : "Erro desconhecido"}`;
+    }
+
+    return { content: [{ type: "text", text }] };
   }
 );
+
+interface RequisicaoCapturada {
+  start?: string;
+  duration?: number;
+  request?: { method?: string; uri?: string };
+  response?: { status_code?: number };
+}
 
 server.tool(
   "ngrok_logs",
@@ -718,27 +792,33 @@ server.tool(
     limit: z.number().optional().describe("Número de requisições para mostrar (default: 50)"),
   },
   async ({ tunnelId, url, limit }) => {
+    const alvo = encontrar(tunnelId, url);
+    if (!alvo) {
+      return { content: [{ type: "text", text: NAO_ENCONTRADO }] };
+    }
+    if (!alvo.webAddr) {
+      return { content: [{ type: "text", text: "❌ O agente deste túnel não expôs a API local; logs indisponíveis." }] };
+    }
+
     try {
-      let targetId = tunnelId;
-      
-      if (!targetId && url) {
-        for (const [id, tunnel] of tunnels) {
-          if (tunnel.url === url) {
-            targetId = id;
-            break;
-          }
-        }
+      const quantidade = Math.min(Math.max(Math.trunc(limit ?? 50), 1), 500);
+      const dados = await apiDoAgente(
+        alvo.webAddr,
+        `/api/requests/http?limit=${quantidade}&tunnel_name=${encodeURIComponent(alvo.nome)}`,
+      );
+      const requisicoes = ((dados as { requests?: RequisicaoCapturada[] }).requests ?? []);
+
+      if (requisicoes.length === 0) {
+        return { content: [{ type: "text", text: `📜 **Logs do Túnel**\n\nNenhuma requisição capturada ainda (a inspeção só vale para túneis HTTP com inspect ativo).` }] };
       }
-      
-      if (!targetId) {
-        return {
-          content: [{ type: "text", text: "❌ Túnel não encontrado." }],
-        };
+
+      let text = `📜 **Logs do Túnel** (${requisicoes.length})\n\n`;
+      for (const r of requisicoes) {
+        const ms = r.duration ? Math.round(r.duration / 1e6) : undefined;
+        text += `• ${r.start ?? ""} ${r.request?.method ?? "?"} ${r.request?.uri ?? "?"} → ${r.response?.status_code ?? "sem resposta"}${ms !== undefined ? ` (${ms} ms)` : ""}\n`;
       }
-      
-      const output = await runNgrok(["inspect", positional(targetId, "ID do túnel"), `--limit=${limit || 50}`]);
-      
-      return { content: [{ type: "text", text: `📜 **Logs do Túnel**\n\n${output}` }] };
+
+      return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
         content: [{
@@ -752,22 +832,23 @@ server.tool(
 
 server.tool(
   "ngrok_api",
-  "Executa comandos da API do ngrok agent",
+  "Consulta a API local do agente ngrok (GET), a mesma da interface web",
   {
-    endpoint: z.string().describe("Endpoint da API (ex: /api/tunnels)"),
+    endpoint: z.string().describe("Caminho na API local do agente (ex: /api/tunnels, /api/requests/http?limit=10)"),
   },
   async ({ endpoint }) => {
     try {
-      const output = await runNgrok(["api", ...endpoint.trim().split(/\s+/)]);
-      
-      let text = `📡 **API Response**\n\n`;
-      try {
-        const json = JSON.parse(output);
-        text += JSON.stringify(json, null, 2);
-      } catch {
-        text += output;
+      // Só caminhos de leitura da API local: nada de host, esquema ou "..".
+      if (!/^\/api\/[A-Za-z0-9_\-\/]*(\?[A-Za-z0-9_=&%.\-]*)?$/.test(endpoint) || endpoint.includes("..")) {
+        return { content: [{ type: "text", text: "❌ Endpoint inválido: use um caminho da API local, como /api/tunnels" }] };
       }
-      
+
+      const webAddr = [...tunnels.values()].find((t) => t.webAddr)?.webAddr ?? "127.0.0.1:4040";
+      const resposta = await apiDoAgente(webAddr, endpoint);
+
+      let text = `📡 **API Response** (${webAddr})\n\n`;
+      text += typeof resposta === "string" ? resposta : JSON.stringify(resposta, null, 2);
+
       return { content: [{ type: "text", text }] };
     } catch (error) {
       return {
@@ -780,7 +861,17 @@ server.tool(
   }
 );
 
+/** Os túneis morrem com o servidor: nenhum agente ngrok fica órfão expondo portas. */
+function encerrarAgentes(): void {
+  for (const processo of new Set([...tunnels.values()].map((t) => t.processo))) matar(processo);
+}
+
 async function main() {
+  process.on("exit", encerrarAgentes);
+  for (const sinal of ["SIGINT", "SIGTERM"] as const) process.on(sinal, () => process.exit(0));
+  // O cliente MCP fecha o stdin ao encerrar a sessão.
+  process.stdin.on("end", () => process.exit(0));
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

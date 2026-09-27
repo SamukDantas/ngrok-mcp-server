@@ -5,7 +5,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "npm run build && node --test tests/injecao-de-comandos.test.mjs"
+    "test": "npm run build && node --test tests/servidor.test.mjs",
+    "test:real": "npm run build && node scripts/teste-real.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

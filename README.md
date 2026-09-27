@@ -4,7 +4,8 @@ Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para cr
 
 - **16 ferramentas**: túneis HTTP, TCP e TLS com opções avançadas (auth básica, OAuth, restrição por IP, mTLS, traffic policy), além de listagem, inspeção, logs, diagnóstico e manutenção do agente
 - TypeScript, SDK oficial do MCP e validação de parâmetros com Zod
-- Usa o ngrok CLI via `npx`: não é preciso instalar o ngrok separadamente
+- Cada túnel é um agente ngrok gerenciado pelo servidor: a URL pública volta na hora, e os túneis são encerrados junto com a sessão MCP
+- Testado contra o ngrok real (`npm run test:real`) e com testes automatizados que não precisam de conta
 
 ## Índice
 
@@ -17,7 +18,7 @@ Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para cr
 
 ## Instalação
 
-**Pré-requisitos:** Node.js 18+ e npm, e uma conta no ngrok (gratuita ou paga).
+**Pré-requisitos:** Node.js 18+ e npm, uma conta no ngrok (gratuita ou paga) e o [agente ngrok v3](https://ngrok.com/download).
 
 ```bash
 git clone https://github.com/SamukDantas/ngrok-mcp-server.git
@@ -28,15 +29,26 @@ npm run build
 
 O build gera `dist/index.js`, que é o ponto de entrada do servidor.
 
+O servidor procura o executável do ngrok nesta ordem:
+
+1. variável de ambiente `NGROK_BIN`;
+2. `ngrokPath` no arquivo de configuração (abaixo);
+3. `bin/ngrok.exe` (Windows) ou `bin/ngrok` dentro do projeto: basta copiar o executável baixado para lá, e a pasta é ignorada pelo git;
+4. o `ngrok` do PATH;
+5. `npx ngrok`, como último recurso.
+
 ## Configuração
 
 O servidor lê o authtoken de `~/.config/opencode/ngrok-config.json` (no Windows, `C:/Users/<você>/.config/opencode/ngrok-config.json`), qualquer que seja o cliente MCP:
 
 ```json
 {
-  "authtoken": "SEU_AUTHTOKEN_AQUI"
+  "authtoken": "SEU_AUTHTOKEN_AQUI",
+  "ngrokPath": "C:/ferramentas/ngrok.exe"
 }
 ```
+
+`ngrokPath` é opcional. Sem `authtoken`, o ngrok usa a própria configuração (`ngrok config add-authtoken`).
 
 Pegue o seu authtoken em https://dashboard.ngrok.com/get-started/your-authtoken.
 
@@ -91,7 +103,7 @@ Depois de configurar, reinicie o cliente e peça ao assistente para executar `ng
 
 | Ferramenta | Descrição |
 |------------|-----------|
-| `ngrok_list_tunnels` | Lista todos os túneis ativos |
+| `ngrok_list_tunnels` | Lista os túneis abertos por este servidor |
 | `ngrok_connect` | Cria um novo túnel (http/https/tcp/tls) |
 | `ngrok_disconnect` | Desconecta um túnel pelo ID ou URL |
 | `ngrok_kill_all` | Desconecta todos os túneis ativos |
@@ -113,15 +125,15 @@ Depois de configurar, reinicie o cliente e peça ao assistente para executar `ng
 | `ngrok_diagnose` | Diagnostica problemas de conectividade |
 | `ngrok_update` | Atualiza o ngrok para a última versão |
 | `ngrok_config_check` | Valida o arquivo de configuração |
-| `ngrok_config_edit` | Abre o arquivo de configuração para edição |
+| `ngrok_config_edit` | Mostra onde ficam os arquivos de configuração, para edição |
 
 ### Inspeção
 
 | Ferramenta | Descrição |
 |------------|-----------|
-| `ngrok_inspect` | Mostra detalhes de um túnel específico |
-| `ngrok_logs` | Mostra os logs de requisições do túnel |
-| `ngrok_api` | Executa comandos da API do agente ngrok |
+| `ngrok_inspect` | Mostra detalhes e métricas de um túnel |
+| `ngrok_logs` | Mostra as requisições HTTP que passaram pelo túnel |
+| `ngrok_api` | Consulta a API local do agente (GET, ex.: `/api/tunnels`) |
 
 ## Exemplos de uso
 
@@ -200,6 +212,17 @@ ngrok_diagnose {"region": "us"}
 | `name` | string | Nome do endpoint |
 | `trafficPolicyFile` | string | Caminho para o arquivo de traffic policy |
 
+## Como os túneis funcionam
+
+Cada `ngrok_http`, `ngrok_tcp`, `ngrok_tls`, `ngrok_connect` ou `ngrok_start` sobe um agente ngrok em segundo plano e devolve a URL pública assim que o agente anuncia o túnel. `ngrok_inspect`, `ngrok_logs` e `ngrok_api` leem a API local desse agente (a mesma da interface web em `127.0.0.1:4040`). `ngrok_disconnect` e `ngrok_kill_all` encerram o agente, e todos os agentes são encerrados quando a sessão MCP termina, para nenhuma porta ficar exposta sem querer.
+
+> No plano gratuito, o ngrok permite poucos agentes simultâneos; ao passar do limite, a ferramenta devolve o erro do ngrok.
+
+## Solução de problemas
+
+- **`x509: certificate signed by unknown authority`**: um antivírus ou proxy está interceptando o TLS do ngrok (por exemplo, o Escudo da Web do Avast). Adicione `*.ngrok-agent.com` às exceções de inspeção HTTPS.
+- **`authentication failed`**: confira o authtoken em `ngrok-config.json` ou rode `ngrok config add-authtoken`.
+
 ## Segurança
 
 Os argumentos das ferramentas vêm do modelo, então são tratados como entrada não confiável. O ngrok é executado sem shell (`execFile` com lista de argumentos): cada valor chega ao ngrok como um único argumento literal, e aspas, `;`, `&`, `$()` ou crases não executam nada. IDs e nomes de túnel que começam com `-` são recusados, para não serem lidos como flags. O authtoken é passado ao ngrok pela variável `NGROK_AUTHTOKEN`, nunca pela linha de comando.
@@ -210,7 +233,13 @@ Os argumentos das ferramentas vêm do modelo, então são tratados como entrada 
 npm test
 ```
 
-Compila e roda os testes: o servidor sobe de verdade via stdio, com um ngrok falso no lugar do `npx`, e os testes verificam o argv recebido.
+Compila e roda os testes automatizados: o servidor sobe de verdade via stdio, com um ngrok falso que registra o argv e imita o log e a API local do agente. Não precisa de conta nem de rede.
+
+```bash
+npm run test:real
+```
+
+Teste contra o ngrok real: sobe um servidor local na porta 3999, abre um túnel com basic auth pelo MCP, confere que a URL pública responde 401 sem credenciais e 200 com elas, lê os logs e a API do agente, desconecta e confere que a URL parou de responder.
 
 ## Licença
 
