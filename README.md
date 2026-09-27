@@ -1,26 +1,36 @@
 # ngrok MCP Server
 
-Servidor MCP (Model Context Protocol) para gerenciar túneis ngrok diretamente do OpenCode ou outros clientes MCP.
+Servidor [MCP (Model Context Protocol)](https://modelcontextprotocol.io) para criar e gerenciar túneis [ngrok](https://ngrok.com) a partir de assistentes de IA: **Claude Code, Claude Desktop, OpenCode** ou qualquer cliente MCP via stdio.
+
+- **16 ferramentas**: túneis HTTP, TCP e TLS com opções avançadas (auth básica, OAuth, restrição por IP, mTLS, traffic policy), além de listagem, inspeção, logs, diagnóstico e manutenção do agente
+- TypeScript, SDK oficial do MCP e validação de parâmetros com Zod
+- Usa o ngrok CLI via `npx`: não é preciso instalar o ngrok separadamente
+
+## Índice
+
+1. [Instalação](#instalação)
+2. [Configuração](#configuração)
+3. [Uso nos clientes MCP](#uso-nos-clientes-mcp)
+4. [Ferramentas disponíveis](#ferramentas-disponíveis)
+5. [Exemplos de uso](#exemplos-de-uso)
+6. [Opções avançadas](#opções-avançadas)
 
 ## Instalação
 
+**Pré-requisitos:** Node.js 18+ e npm, e uma conta no ngrok (gratuita ou paga).
+
 ```bash
-# Clone o repositório
 git clone https://github.com/SamukDantas/ngrok-mcp-server.git
 cd ngrok-mcp-server
-
-# Instale as dependências
 npm install
-
-# Compile o TypeScript
 npm run build
 ```
 
+O build gera `dist/index.js`, que é o ponto de entrada do servidor.
+
 ## Configuração
 
-### 1. Configure o authtoken do ngrok
-
-Crie um arquivo `ngrok-config.json` no diretório `~/.config/opencode/`:
+O servidor lê o authtoken de `~/.config/opencode/ngrok-config.json` (no Windows, `C:/Users/<você>/.config/opencode/ngrok-config.json`), qualquer que seja o cliente MCP:
 
 ```json
 {
@@ -28,26 +38,56 @@ Crie um arquivo `ngrok-config.json` no diretório `~/.config/opencode/`:
 }
 ```
 
-Para obter seu authtoken, vá em: https://dashboard.ngrok.com/get-started/your-authtoken
+Pegue o seu authtoken em https://dashboard.ngrok.com/get-started/your-authtoken.
 
-### 2. Configure o OpenCode
+> Este arquivo contém credenciais: não o versione. O `.gitignore` do projeto já ignora `*-config.json`.
 
-Adicione o MCP do ngrok no seu `opencode.json`:
+## Uso nos clientes MCP
+
+Nos exemplos, troque `/caminho/para` pelo diretório onde você clonou o repositório. No Windows, use barras normais (`C:/Users/...`).
+
+### Claude Code
+
+```bash
+claude mcp add ngrok -- node /caminho/para/ngrok-mcp-server/dist/index.js
+```
+
+### Claude Desktop
+
+Em `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "ngrok": {
       "command": "node",
-      "args": ["C:/Users/SamukDantas/.config/opencode/mcp-servers/ngrok/dist/index.js"]
+      "args": ["/caminho/para/ngrok-mcp-server/dist/index.js"]
     }
   }
 }
 ```
 
-## Ferramentas Disponíveis
+### OpenCode
 
-### Gerenciamento de Túneis
+Em `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "ngrok": {
+      "type": "local",
+      "command": ["node", "/caminho/para/ngrok-mcp-server/dist/index.js"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Depois de configurar, reinicie o cliente e peça ao assistente para executar `ngrok_status` para confirmar que a sessão responde.
+
+## Ferramentas disponíveis
+
+### Gerenciamento de túneis
 
 | Ferramenta | Descrição |
 |------------|-----------|
@@ -64,7 +104,7 @@ Adicione o MCP do ngrok no seu `opencode.json`:
 | `ngrok_tcp` | Cria um túnel TCP com opções avançadas |
 | `ngrok_tls` | Cria um túnel TLS com opções avançadas |
 
-### Configuração e Manutenção
+### Configuração e manutenção
 
 | Ferramenta | Descrição |
 |------------|-----------|
@@ -81,81 +121,40 @@ Adicione o MCP do ngrok no seu `opencode.json`:
 |------------|-----------|
 | `ngrok_inspect` | Mostra detalhes de um túnel específico |
 | `ngrok_logs` | Mostra os logs de requisições do túnel |
-| `ngrok_api` | Executa comandos da API do ngrok agent |
+| `ngrok_api` | Executa comandos da API do agente ngrok |
 
-## Exemplos de Uso
+## Exemplos de uso
 
-### Criar um túnel HTTP básico
+Cada exemplo mostra o nome da ferramenta seguido dos argumentos JSON. Na prática, basta pedir ao assistente em linguagem natural ("abre um túnel HTTP para a porta 3000 com senha"), e ele escolhe a ferramenta e os argumentos.
 
-```javascript
-await ngrok_http({ port: 3000 });
+```text
+# Túnel HTTP básico
+ngrok_http {"port": 3000}
+
+# Túnel HTTP com autenticação básica
+ngrok_http {"port": 3000, "basicAuth": "usuario:senha"}
+
+# Túnel HTTP protegido por OAuth
+ngrok_http {"port": 8080, "oauthProvider": "google", "oauthAllowDomain": "exemplo.com", "oauthScope": "email,profile"}
+
+# Túnel HTTP com restrição por IP
+ngrok_http {"port": 3000, "cidrAllow": "192.168.1.0/24", "cidrDeny": "10.0.0.0/8"}
+
+# Túnel TCP
+ngrok_tcp {"port": 22}
+
+# Túnel TLS com certificado próprio
+ngrok_tls {"port": 443, "crt": "/caminho/cert.crt", "key": "/caminho/key.key"}
+
+# Listar e desconectar túneis
+ngrok_list_tunnels {}
+ngrok_disconnect {"url": "https://abc123.ngrok.io"}
+
+# Diagnóstico de conectividade
+ngrok_diagnose {"region": "us"}
 ```
 
-### Criar um túnel HTTP com autenticação
-
-```javascript
-await ngrok_http({
-  port: 3000,
-  basicAuth: "user:password"
-});
-```
-
-### Criar um túnel com OAuth
-
-```javascript
-await ngrok_http({
-  port: 8080,
-  oauthProvider: "google",
-  oauthAllowDomain: "exemplo.com",
-  oauthScope: "email,profile"
-});
-```
-
-### Cri
-
-```javascript
-ar um túnel TCPawait ngrok_tcp({ port: 22 });
-```
-
-### Criar um túnel TLS com certificado
-
-```javascript
-await ngrok_tls({
-  port: 443,
-  crt: "/path/to/cert.crt",
-  key: "/path/to/key.key"
-});
-```
-
-### Criar um túnel com IP restriction
-
-```javascript
-await ngrok_http({
-  port: 3000,
-  cidrAllow: "192.168.1.0/24",
-  cidrDeny: "10.0.0.0/8"
-});
-```
-
-### Listar túneis ativos
-
-```javascript
-await ngrok_list_tunnels();
-```
-
-### Desconectar um túnel
-
-```javascript
-await ngrok_disconnect({ url: "https://abc123.ngrok.io" });
-```
-
-### Diagnóstico de conectividade
-
-```javascript
-await ngrok_diagnose({ region: "us" });
-```
-
-## Opções Avançadas
+## Opções avançadas
 
 ### ngrok_http
 
@@ -165,25 +164,25 @@ await ngrok_diagnose({ region: "us" });
 | `url` | string | URL específica do endpoint |
 | `subdomain` | string | Subdomínio (requer plano pago) |
 | `domain` | string | Domínio customizado (requer plano pago) |
-| `basicAuth` | string | Auth básico (user:pass) |
+| `basicAuth` | string | Auth básica (`usuario:senha`) |
 | `hostHeader` | string | Host header para roteamento |
-| `requestHeaderAdd` | string | Adicionar header na requisição |
-| `responseHeaderAdd` | string | Adicionar header na resposta |
-| `compression` | boolean | Habilitar compressão gzip |
-| `cidrAllow` | string | Permitir CIDRs específicos |
-| `cidrDeny` | string | Bloquear CIDRs específicos |
+| `requestHeaderAdd` | string | Adiciona header na requisição |
+| `responseHeaderAdd` | string | Adiciona header na resposta |
+| `compression` | boolean | Habilita compressão gzip |
+| `cidrAllow` | string | Permite CIDRs específicos |
+| `cidrDeny` | string | Bloqueia CIDRs específicos |
 | `oauthProvider` | string | Provedor OAuth (google, github, microsoft, slack) |
 | `oauthAllowDomain` | string | Domínios permitidos no OAuth |
-| `oauthAllowEmail` | string | Emails permitidos no OAuth |
-| `oauthScope` | string | Scopes OAuth (comma-separated) |
+| `oauthAllowEmail` | string | E-mails permitidos no OAuth |
+| `oauthScope` | string | Scopes OAuth (separados por vírgula) |
 | `webhookVerification` | string | Verificação de webhook |
 | `webhookSecret` | string | Secret do webhook |
-| `mutualTlsCas` | string | Path para CA cert para mTLS |
+| `mutualTlsCas` | string | Caminho para o certificado da CA (mTLS) |
 | `metadata` | string | Metadados customizados (JSON) |
 | `description` | string | Descrição do endpoint |
 | `name` | string | Nome do endpoint |
-| `inspect` | boolean | Habilitar inspeção HTTP |
-| `trafficPolicyFile` | string | Path para arquivo de traffic policy |
+| `inspect` | boolean | Habilita a inspeção HTTP |
+| `trafficPolicyFile` | string | Caminho para o arquivo de traffic policy |
 
 ### ngrok_tls
 
@@ -191,23 +190,16 @@ await ngrok_diagnose({ region: "us" });
 |-----------|------|-----------|
 | `port` | number | **Obrigatório**. Porta local |
 | `url` | string | URL específica do endpoint TLS |
-| `crt` | string | Path para certificado TLS |
-| `key` | string | Path para chave TLS |
-| `mutualTlsCas` | string | Path para CA cert para mTLS |
-| `cidrAllow` | string | Permitir CIDRs específicos |
-| `cidrDeny` | string | Bloquear CIDRs específicos |
+| `crt` | string | Caminho para o certificado TLS |
+| `key` | string | Caminho para a chave TLS |
+| `mutualTlsCas` | string | Caminho para o certificado da CA (mTLS) |
+| `cidrAllow` | string | Permite CIDRs específicos |
+| `cidrDeny` | string | Bloqueia CIDRs específicos |
 | `metadata` | string | Metadados customizados |
 | `description` | string | Descrição do endpoint |
 | `name` | string | Nome do endpoint |
-| `trafficPolicyFile` | string | Path para traffic policy |
-
-## Requisitos
-
-- Node.js 18+
-- npm ou yarn
-- ngrok CLI (instalado automaticamente via npx)
-- Conta no ngrok (gratuita ou paga)
+| `trafficPolicyFile` | string | Caminho para o arquivo de traffic policy |
 
 ## Licença
 
-MIT
+[MIT](LICENSE) © 2026 Samuel Dantas
