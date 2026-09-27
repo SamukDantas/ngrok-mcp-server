@@ -4,10 +4,10 @@ import { z } from "zod";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 interface NgrokConfig {
   authtoken: string;
@@ -22,24 +22,58 @@ interface TunnelInfo {
 
 const tunnels: Map<string, TunnelInfo> = new Map();
 
-function loadConfig(): NgrokConfig {
-  const configPath = path.join(os.homedir(), ".config", "opencode", "ngrok-config.json");
-  
-  if (!fs.existsSync(configPath)) {
-    throw new Error(`Config file not found: ${configPath}`);
-  }
-  
-  return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+function configPath(): string {
+  return path.join(os.homedir(), ".config", "opencode", "ngrok-config.json");
 }
 
-async function runNgrok(args: string): Promise<string> {
+/** Authtoken do arquivo de configuração, se existir. Ausente: o ngrok usa a própria configuração. */
+function loadAuthtoken(): string | undefined {
+  const file = configPath();
+  if (!fs.existsSync(file)) return undefined;
+  const config = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<NgrokConfig>;
+  return typeof config.authtoken === "string" && config.authtoken ? config.authtoken : undefined;
+}
+
+/**
+ * Como executar o `npx` sem shell. No Windows o `npx` é um .cmd, que o Node só
+ * executa via shell; por isso o `npx-cli.js` do npm é chamado pelo próprio Node.
+ * `NGROK_MCP_RUNNER` (caminho de um script .js) substitui o npx nos testes.
+ */
+function npxCommand(): { command: string; prefix: string[] } {
+  const runner = process.env.NGROK_MCP_RUNNER;
+  if (runner) return { command: process.execPath, prefix: [runner] };
+  if (process.platform !== "win32") return { command: "npx", prefix: [] };
+  const cli = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npx-cli.js");
+  return { command: process.execPath, prefix: [cli] };
+}
+
+/**
+ * Executa `npx ngrok <args>` SEM shell: cada argumento é passado como está,
+ * então valores vindos do modelo (auth, descrição, metadados, IDs) não podem
+ * injetar comandos. O authtoken vai por variável de ambiente, não por argumento,
+ * para não aparecer na lista de processos.
+ */
+async function runNgrok(args: string[]): Promise<string> {
+  const { command, prefix } = npxCommand();
+  const authtoken = loadAuthtoken();
   try {
-    const { stdout, stderr } = await execAsync(`npx ngrok ${args}`, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+    const { stdout, stderr } = await execFileAsync(command, [...prefix, "ngrok", ...args], {
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      windowsHide: true,
+      env: authtoken ? { ...process.env, NGROK_AUTHTOKEN: authtoken } : process.env,
+    });
     return stdout || stderr;
   } catch (error: unknown) {
     const err = error as { message?: string; stdout?: string; stderr?: string };
     return err.stdout || err.stderr || err.message || "Unknown error";
   }
+}
+
+/** Argumento posicional vindo do modelo não pode começar com "-" (seria lido como flag do ngrok). */
+function positional(value: string, label: string): string {
+  if (value.startsWith("-")) throw new Error(`${label} inválido: não pode começar com "-"`);
+  return value;
 }
 
 const server = new McpServer({
@@ -53,7 +87,7 @@ server.tool(
   {},
   async () => {
     try {
-      const output = await runNgrok("api tunnels list --format=json");
+      const output = await runNgrok(["api", "tunnels", "list", "--format=json"]);
       let data;
       try {
         data = JSON.parse(output);
@@ -116,11 +150,11 @@ server.tool(
   },
   async ({ port, subdomain, domain, proto, auth }) => {
     try {
-      let args = `${proto} ${port}`;
+      const args: string[] = [proto, String(port)];
       
-      if (subdomain) args += ` --subdomain=${subdomain}`;
-      if (domain) args += ` --domain=${domain}`;
-      if (auth) args += ` --basic-auth="${auth}"`;
+      if (subdomain) args.push(`--subdomain=${subdomain}`);
+      if (domain) args.push(`--domain=${domain}`);
+      if (auth) args.push(`--basic-auth=${auth}`);
       
       const output = await runNgrok(args);
       
@@ -181,7 +215,7 @@ server.tool(
         };
       }
       
-      await runNgrok(`disconnect ${targetId}`);
+      await runNgrok(["disconnect", positional(targetId, "ID do túnel")]);
       tunnels.delete(targetId);
       
       return {
@@ -207,7 +241,7 @@ server.tool(
   {},
   async () => {
     try {
-      const output = await runNgrok("version");
+      const output = await runNgrok(["version"]);
       
       let text = `📊 **Status ngrok**\n\n`;
       text += `Versão: ${output.trim()}\n`;
@@ -262,30 +296,30 @@ server.tool(
     mutualTlsCas, metadata, description, name, inspect, trafficPolicyFile
   }) => {
     try {
-      let args = `http ${port}`;
+      const args: string[] = ["http", String(port)];
       
-      if (url) args += ` --url=${url}`;
-      if (subdomain) args += ` --subdomain=${subdomain}`;
-      if (domain) args += ` --domain=${domain}`;
-      if (basicAuth) args += ` --basic-auth="${basicAuth}"`;
-      if (hostHeader) args += ` --host-header=${hostHeader}`;
-      if (requestHeaderAdd) args += ` --request-header-add="${requestHeaderAdd}"`;
-      if (responseHeaderAdd) args += ` --response-header-add="${responseHeaderAdd}"`;
-      if (compression) args += ` --compression`;
-      if (cidrAllow) args += ` --cidr-allow=${cidrAllow}`;
-      if (cidrDeny) args += ` --cidr-deny=${cidrDeny}`;
-      if (oauthProvider) args += ` --oauth=${oauthProvider}`;
-      if (oauthAllowDomain) args += ` --oauth-allow-domain=${oauthAllowDomain}`;
-      if (oauthAllowEmail) args += ` --oauth-allow-email=${oauthAllowEmail}`;
-      if (oauthScope) args += ` --oauth-scope=${oauthScope}`;
-      if (webhookVerification) args += ` --verify-webhook=${webhookVerification}`;
-      if (webhookSecret) args += ` --verify-webhook-secret=${webhookSecret}`;
-      if (mutualTlsCas) args += ` --mutual-tls-cas=${mutualTlsCas}`;
-      if (metadata) args += ` --metadata="${metadata}"`;
-      if (description) args += ` --description="${description}"`;
-      if (name) args += ` --name=${name}`;
-      if (inspect === false) args += ` --inspect=false`;
-      if (trafficPolicyFile) args += ` --traffic-policy-file=${trafficPolicyFile}`;
+      if (url) args.push(`--url=${url}`);
+      if (subdomain) args.push(`--subdomain=${subdomain}`);
+      if (domain) args.push(`--domain=${domain}`);
+      if (basicAuth) args.push(`--basic-auth=${basicAuth}`);
+      if (hostHeader) args.push(`--host-header=${hostHeader}`);
+      if (requestHeaderAdd) args.push(`--request-header-add=${requestHeaderAdd}`);
+      if (responseHeaderAdd) args.push(`--response-header-add=${responseHeaderAdd}`);
+      if (compression) args.push("--compression");
+      if (cidrAllow) args.push(`--cidr-allow=${cidrAllow}`);
+      if (cidrDeny) args.push(`--cidr-deny=${cidrDeny}`);
+      if (oauthProvider) args.push(`--oauth=${oauthProvider}`);
+      if (oauthAllowDomain) args.push(`--oauth-allow-domain=${oauthAllowDomain}`);
+      if (oauthAllowEmail) args.push(`--oauth-allow-email=${oauthAllowEmail}`);
+      if (oauthScope) args.push(`--oauth-scope=${oauthScope}`);
+      if (webhookVerification) args.push(`--verify-webhook=${webhookVerification}`);
+      if (webhookSecret) args.push(`--verify-webhook-secret=${webhookSecret}`);
+      if (mutualTlsCas) args.push(`--mutual-tls-cas=${mutualTlsCas}`);
+      if (metadata) args.push(`--metadata=${metadata}`);
+      if (description) args.push(`--description=${description}`);
+      if (name) args.push(`--name=${name}`);
+      if (inspect === false) args.push("--inspect=false");
+      if (trafficPolicyFile) args.push(`--traffic-policy-file=${trafficPolicyFile}`);
       
       const output = await runNgrok(args);
       
@@ -340,16 +374,16 @@ server.tool(
   },
   async ({ port, url, remotePort, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile }) => {
     try {
-      let args = `tcp ${port}`;
+      const args: string[] = ["tcp", String(port)];
       
-      if (url) args += ` --url=${url}`;
-      if (remotePort) args += ` --remote-port=${remotePort}`;
-      if (cidrAllow) args += ` --cidr-allow=${cidrAllow}`;
-      if (cidrDeny) args += ` --cidr-deny=${cidrDeny}`;
-      if (metadata) args += ` --metadata="${metadata}"`;
-      if (description) args += ` --description="${description}"`;
-      if (name) args += ` --name=${name}`;
-      if (trafficPolicyFile) args += ` --traffic-policy-file=${trafficPolicyFile}`;
+      if (url) args.push(`--url=${url}`);
+      if (remotePort) args.push(`--remote-port=${remotePort}`);
+      if (cidrAllow) args.push(`--cidr-allow=${cidrAllow}`);
+      if (cidrDeny) args.push(`--cidr-deny=${cidrDeny}`);
+      if (metadata) args.push(`--metadata=${metadata}`);
+      if (description) args.push(`--description=${description}`);
+      if (name) args.push(`--name=${name}`);
+      if (trafficPolicyFile) args.push(`--traffic-policy-file=${trafficPolicyFile}`);
       
       const output = await runNgrok(args);
       
@@ -403,18 +437,18 @@ server.tool(
   },
   async ({ port, url, crt, key, mutualTlsCas, cidrAllow, cidrDeny, metadata, description, name, trafficPolicyFile }) => {
     try {
-      let args = `tls ${port}`;
+      const args: string[] = ["tls", String(port)];
       
-      if (url) args += ` --url=${url}`;
-      if (crt) args += ` --crt=${crt}`;
-      if (key) args += ` --key=${key}`;
-      if (mutualTlsCas) args += ` --mutual-tls-cas=${mutualTlsCas}`;
-      if (cidrAllow) args += ` --cidr-allow=${cidrAllow}`;
-      if (cidrDeny) args += ` --cidr-deny=${cidrDeny}`;
-      if (metadata) args += ` --metadata="${metadata}"`;
-      if (description) args += ` --description="${description}"`;
-      if (name) args += ` --name=${name}`;
-      if (trafficPolicyFile) args += ` --traffic-policy-file=${trafficPolicyFile}`;
+      if (url) args.push(`--url=${url}`);
+      if (crt) args.push(`--crt=${crt}`);
+      if (key) args.push(`--key=${key}`);
+      if (mutualTlsCas) args.push(`--mutual-tls-cas=${mutualTlsCas}`);
+      if (cidrAllow) args.push(`--cidr-allow=${cidrAllow}`);
+      if (cidrDeny) args.push(`--cidr-deny=${cidrDeny}`);
+      if (metadata) args.push(`--metadata=${metadata}`);
+      if (description) args.push(`--description=${description}`);
+      if (name) args.push(`--name=${name}`);
+      if (trafficPolicyFile) args.push(`--traffic-policy-file=${trafficPolicyFile}`);
       
       const output = await runNgrok(args);
       
@@ -461,19 +495,19 @@ server.tool(
   },
   async ({ tunnels: tunnelNames, all, config }) => {
     try {
-      let args = "start";
+      const args: string[] = ["start"];
       
       if (all) {
-        args += " --all";
+        args.push("--all");
       } else if (tunnelNames) {
-        args += ` ${tunnelNames}`;
+        args.push(...tunnelNames.trim().split(/\s+/).map((n) => positional(n, "Nome de túnel")));
       } else {
         return {
           content: [{ type: "text", text: "❌ Especifique nomes de túneis ou use --all" }],
         };
       }
       
-      if (config) args += ` --config=${config}`;
+      if (config) args.push(`--config=${config}`);
       
       const output = await runNgrok(args);
       
@@ -502,11 +536,11 @@ server.tool(
   },
   async ({ region, ipv6, writeReport }) => {
     try {
-      let args = "diagnose";
+      const args: string[] = ["diagnose"];
       
-      if (region) args += ` --region=${region}`;
-      if (ipv6) args += ` --ipv6`;
-      if (writeReport) args += ` --write-report=${writeReport}`;
+      if (region) args.push(`--region=${region}`);
+      if (ipv6) args.push("--ipv6");
+      if (writeReport) args.push(`--write-report=${writeReport}`);
       
       const output = await runNgrok(args);
       
@@ -536,9 +570,9 @@ server.tool(
   },
   async ({ channel }) => {
     try {
-      let args = "update";
+      const args: string[] = ["update"];
       
-      if (channel) args += ` --channel=${channel}`;
+      if (channel) args.push(`--channel=${channel}`);
       
       const output = await runNgrok(args);
       
@@ -565,9 +599,9 @@ server.tool(
   },
   async ({ config }) => {
     try {
-      let args = "config check";
+      const args: string[] = ["config", "check"];
       
-      if (config) args += ` --config=${config}`;
+      if (config) args.push(`--config=${config}`);
       
       const output = await runNgrok(args);
       
@@ -595,7 +629,7 @@ server.tool(
   {},
   async () => {
     try {
-      const output = await runNgrok("config edit");
+      const output = await runNgrok(["config", "edit"]);
       
       return { content: [{ type: "text", text: `📝 **Configuração**\n\n${output}` }] };
     } catch (error) {
@@ -615,7 +649,7 @@ server.tool(
   {},
   async () => {
     try {
-      await runNgrok("disconnect --all");
+      await runNgrok(["disconnect", "--all"]);
       tunnels.clear();
       
       return {
@@ -661,7 +695,7 @@ server.tool(
         };
       }
       
-      const output = await runNgrok(`inspect ${targetId}`);
+      const output = await runNgrok(["inspect", positional(targetId, "ID do túnel")]);
       
       return { content: [{ type: "text", text: `📋 **Detalhes do Túnel**\n\n${output}` }] };
     } catch (error) {
@@ -702,7 +736,7 @@ server.tool(
         };
       }
       
-      const output = await runNgrok(`inspect ${targetId} --limit=${limit || 50}`);
+      const output = await runNgrok(["inspect", positional(targetId, "ID do túnel"), `--limit=${limit || 50}`]);
       
       return { content: [{ type: "text", text: `📜 **Logs do Túnel**\n\n${output}` }] };
     } catch (error) {
@@ -724,7 +758,7 @@ server.tool(
   },
   async ({ endpoint }) => {
     try {
-      const output = await runNgrok(`api ${endpoint}`);
+      const output = await runNgrok(["api", ...endpoint.trim().split(/\s+/)]);
       
       let text = `📡 **API Response**\n\n`;
       try {
